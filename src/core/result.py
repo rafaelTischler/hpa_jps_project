@@ -1,5 +1,7 @@
 """Resultado padronizado de uma busca de caminho."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -34,3 +36,24 @@ class SearchResult:
     num_jump_points: int = 0
     abstract_graph_size: int = 0
     extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class BenchmarkResult:
+    """Estrutura padronizada para registrar uma execução de benchmark."""
+
+    algorithm: str
+    map_name: str
+    width: int
+    height: int
+    density: str
+    scenario: int
+    execution_time_ms: float
+    preprocessing_time_ms: float
+    nodes_expanded: int
+    path_length: float
+    path_cost: float
+    portals: int
+    jump_points: int
+    abstract_graph_size: int
+    success: bool

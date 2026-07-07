@@ -9,6 +9,7 @@ from typing import Any
 from src.algorithms.astar import AStar
 from src.algorithms.base_pathfinder import PathfindingAlgorithm
 from src.core.grid import Grid
+from src.core.heuristics import octile
 from src.core.result import SearchResult
 from src.core.priority_queue import PriorityQueue
 
@@ -627,7 +628,52 @@ class HPAStar(PathfindingAlgorithm):
         return deduped
 
     def _compute_path_cost(self, path: list[tuple[int, int]]) -> float:
+        def bresenham_line(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, int]]:
+            """Gera pontos discretos entre `a` e `b` usando Bresenham (inclui ambos)."""
+            x0, y0 = a
+            x1, y1 = b
+            points: list[tuple[int, int]] = []
+            dx = abs(x1 - x0)
+            sx = 1 if x0 < x1 else -1
+            dy = -abs(y1 - y0)
+            sy = 1 if y0 < y1 else -1
+            err = dx + dy  # error value e_xy
+            x, y = x0, y0
+            while True:
+                points.append((x, y))
+                if x == x1 and y == y1:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy
+                    x += sx
+                if e2 <= dx:
+                    err += dx
+                    y += sy
+            return points
+
         total = 0.0
         for previous, current in zip(path, path[1:]):
-            total += self.grid.cost(previous, current)
+            try:
+                total += self.grid.cost(previous, current)
+                continue
+            except ValueError:
+                # Expand using Bresenham to obtain adjacent steps between points.
+                segment = bresenham_line(previous, current)
+                if len(segment) < 2:
+                    total += octile(previous, current)
+                    continue
+                # Verify walkability and sum costs for consecutive adjacent cells.
+                ok = True
+                for a, b in zip(segment, segment[1:]):
+                    if not self.grid.is_walkable(*b):
+                        ok = False
+                        break
+                    try:
+                        total += self.grid.cost(a, b)
+                    except ValueError:
+                        ok = False
+                        break
+                if not ok:
+                    total += octile(previous, current)
         return total

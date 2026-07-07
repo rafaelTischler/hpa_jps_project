@@ -13,8 +13,10 @@ from src.algorithms.astar import AStar
 from src.algorithms.hpa_jps import HPAJPS
 from src.algorithms.hpa_star import HPAStar
 from src.algorithms.jps import JPS
+from src.benchmark.benchmark_suite import build_benchmark_suite
 from src.benchmark.experiment_runner import build_algorithms, run_experiment
-from src.benchmark.metrics_writer import write_results
+from src.benchmark.metrics_writer import write_benchmark_outputs, write_results
+from src.benchmark.plot_generator import generate_plots
 from src.io.map_loader import generate_synthetic_map, load_map, load_scenarios
 from src.visualization.map_renderer import render_map
 from src.visualization.plotter import plot_results
@@ -42,6 +44,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=5,
         help="Quantos pares start/goal do arquivo .scen usar (apenas com --map real)",
     )
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Executa o benchmark completo e gera CSVs e gráficos")
+    benchmark_parser.add_argument("--sizes", nargs="+", type=int, default=[256, 512, 1024])
+    benchmark_parser.add_argument("--densities", nargs="+", default=["low", "medium", "high"])
+    benchmark_parser.add_argument("--maps-per-configuration", type=int, default=10)
+    benchmark_parser.add_argument("--scenarios-per-map", type=int, default=50)
+    benchmark_parser.add_argument("--repetitions", type=int, default=3)
+    benchmark_parser.add_argument("--use-real-maps", action="store_true", help="Use .map/.scen files from data/maps instead of synthetic maps")
 
     plot_parser = subparsers.add_parser("plot", help="Gera gráficos a partir do CSV")
     plot_parser.add_argument("--input", default="results/raw/experiment_results.csv")
@@ -112,19 +122,17 @@ def main(argv: list[str] | None = None) -> int:
 
             algorithms = build_algorithms(grid)
             results = run_experiment(None, algorithms, real_scenarios, grid=grid)
-            for row in results:
-                row["map_name"] = map_stem
-                row["density"] = density_label
             output_path = write_results(results)
-            grouped2: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            grouped2: dict[str, list[Any]] = defaultdict(list)
             for row in results:
-                grouped2[row["algorithm"]].append(row)
+                name = row.algorithm if hasattr(row, "algorithm") else row["algorithm"]
+                grouped2[name].append(row)
             print(f"Wrote {len(results)} rows to {output_path} (mapa real: {map_stem}, {grid.width}x{grid.height})")
             for algorithm in sorted(grouped2):
                 rows = grouped2[algorithm]
-                avg_nodes = sum(row["nodes_expanded"] for row in rows) / max(1, len(rows))
-                avg_exec = sum(row["execution_time_ms"] for row in rows) / max(1, len(rows))
-                avg_prep = sum(row["preprocessing_time_ms"] for row in rows) / max(1, len(rows))
+                avg_nodes = sum(getattr(row, "nodes_expanded", row["nodes_expanded"]) for row in rows) / max(1, len(rows))
+                avg_exec = sum(getattr(row, "execution_time_ms", row["execution_time_ms"]) for row in rows) / max(1, len(rows))
+                avg_prep = sum(getattr(row, "preprocessing_time_ms", row["preprocessing_time_ms"]) for row in rows) / max(1, len(rows))
                 print(f"{algorithm}: nodes_expanded={avg_nodes:.2f} execution_time_ms={avg_exec:.3f} preprocessing_time_ms={avg_prep:.3f}")
             return 0
 
@@ -149,16 +157,65 @@ def main(argv: list[str] | None = None) -> int:
         algorithms = build_algorithms(grid)
         results = run_experiment(args.map, algorithms, scenarios, grid=None)
         output_path = write_results(results)
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        grouped: dict[str, list[Any]] = defaultdict(list)
         for row in results:
-            grouped[row["algorithm"]].append(row)
+            grouped[row.algorithm if hasattr(row, "algorithm") else row["algorithm"]].append(row)
         print(f"Wrote {len(results)} rows to {output_path}")
         for algorithm in sorted(grouped):
             rows = grouped[algorithm]
-            avg_nodes = sum(row["nodes_expanded"] for row in rows) / max(1, len(rows))
-            avg_exec = sum(row["execution_time_ms"] for row in rows) / max(1, len(rows))
-            avg_graph = sum(row["abstract_graph_size"] for row in rows) / max(1, len(rows))
+            avg_nodes = sum(getattr(row, "nodes_expanded", row["nodes_expanded"]) for row in rows) / max(1, len(rows))
+            avg_exec = sum(getattr(row, "execution_time_ms", row["execution_time_ms"]) for row in rows) / max(1, len(rows))
+            avg_graph = sum(getattr(row, "abstract_graph_size", row["abstract_graph_size"]) for row in rows) / max(1, len(rows))
             print(f"{algorithm}: nodes_expanded={avg_nodes:.2f} execution_time_ms={avg_exec:.3f} abstract_graph_size={avg_graph:.2f}")
+        return 0
+
+    if args.command == "benchmark":
+        suite = build_benchmark_suite(
+            sizes=args.sizes,
+            densities={label: {"low": 0.10, "medium": 0.25, "high": 0.40}[label] for label in args.densities},
+            maps_per_configuration=args.maps_per_configuration,
+            scenarios_per_map=args.scenarios_per_map,
+            repetitions=args.repetitions,
+            use_real_maps=args.use_real_maps,
+        )
+        results = []
+        for config in suite:
+            if config.get("source") == "real_map":
+                grid = load_map(config["map_path"])
+                scenarios = []
+                for scen_path in config.get("scen_paths", []):
+                    scenarios.extend(load_scenarios(scen_path))
+                if not scenarios:
+                    scenarios = [((0, 0), (grid.width - 1, grid.height - 1))]
+                scenarios = scenarios[:3]
+            else:
+                grid = generate_synthetic_map(config["width"], config["height"], config["density"], seed=42)
+                scenarios = config["scenarios"]
+
+            algorithms = build_algorithms(grid)
+            scenario_results = run_experiment(config.get("map_path"), algorithms, scenarios, grid=grid, repetitions=config.get("repetitions", args.repetitions))
+            results.extend(scenario_results)
+        raw_path, summary_path = write_benchmark_outputs(results)
+        legacy_path = write_results(results, output_path="results/raw/experiment_results.csv")
+        generated = generate_plots(raw_path)
+        grouped: dict[str, list[Any]] = {}
+        for row in results:
+            grouped.setdefault(row.algorithm, []).append(row)
+        print("======================================================")
+        print("RESULTADOS FINAIS")
+        print("======================================================")
+        for config in suite[:3]:
+            if config.get("source") == "real_map":
+                print(f"Mapa: {config['map_name']} (real)")
+            else:
+                print(f"Mapa: {config['width']}x{config['height']} {config['density_label'].upper()}")
+            break
+        for algorithm, rows in sorted(grouped.items()):
+            avg_exec = sum(row.execution_time_ms for row in rows) / max(1, len(rows))
+            avg_nodes = sum(row.nodes_expanded for row in rows) / max(1, len(rows))
+            print(f"{algorithm}: tempo={avg_exec:.3f} ms nós={avg_nodes:.1f}")
+        print(f"Benchmark completo: {len(results)} execuções | raw={raw_path} | summary={summary_path} | legacy={legacy_path}")
+        print("\n".join(generated))
         return 0
 
     if args.command == "plot":

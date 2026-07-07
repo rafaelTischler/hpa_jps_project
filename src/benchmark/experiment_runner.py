@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 from typing import Any, Sequence
+import os
+import multiprocessing
 
 from src.algorithms.astar import AStar
 from src.algorithms.base_pathfinder import PathfindingAlgorithm
@@ -12,7 +14,26 @@ from src.algorithms.hpa_jps import HPAJPS
 from src.algorithms.hpa_star import HPAStar
 from src.algorithms.jps import JPS
 from src.core.grid import Grid
-from src.io.map_loader import Scenario, generate_synthetic_map, load_map
+from src.core.result import BenchmarkResult
+from src.io.map_loader import Scenario, generate_synthetic_map, load_map, load_scenarios
+
+
+def _benchmark_worker(q, cls_name, grid, alg_kwargs, start, goal):
+    try:
+        if cls_name == "JPS":
+            alg = JPS(grid)
+        elif cls_name == "HPAStar":
+            alg = HPAStar(grid, cluster_size=alg_kwargs.get("cluster_size", 10))
+        elif cls_name == "HPAJPS":
+            alg = HPAJPS(grid, cluster_size=alg_kwargs.get("cluster_size", 10), hybrid=alg_kwargs.get("hybrid", True))
+        elif cls_name == "AStar":
+            alg = AStar(grid)
+        else:
+            alg = AStar(grid)
+        res = alg.search(start, goal)
+        q.put(res)
+    except Exception as e:  # pragma: no cover - safety in subprocess
+        q.put(e)
 
 
 def run_experiment(
@@ -20,36 +41,45 @@ def run_experiment(
     algorithms: Sequence[PathfindingAlgorithm],
     scenarios: Sequence[Any],
     grid: Grid | None = None,
-) -> list[dict[str, Any]]:
-    """Executa todos os algoritmos sobre os mesmos pares start/goal do mesmo mapa.
-
-    O ``map_path`` pode apontar para um arquivo ``.map`` real ou para um mapa sintético
-    gerado quando o arquivo não existir. Cada cenário pode ser um ``Scenario`` da
-    camada de I/O, um ``dict`` com ``start``/``goal`` ou uma tupla ``(start, goal)``.
-    """
-    results: list[dict[str, Any]] = []
+    repetitions: int = 30,
+) -> list[BenchmarkResult]:
+    """Executa os algoritmos para cada mapa, cenário e repetição."""
+    results: list[BenchmarkResult] = []
     cached_hierarchy_algorithms: dict[tuple[str, str, str, tuple[int, int]], dict[str, PathfindingAlgorithm]] = {}
 
-    for run_id, scenario in enumerate(scenarios):
+    for scenario_config in scenarios:
         scenario_grid = grid
         map_name = "synthetic"
         density_label = "custom"
+        if map_path is not None:
+            map_name = Path(map_path).stem
+        elif isinstance(scenario_config, Scenario):
+            map_name = Path(scenario_config.map_name).stem
         if scenario_grid is None:
-            if isinstance(scenario, dict):
-                width = int(scenario.get("width", 256))
-                height = int(scenario.get("height", width))
-                density = float(scenario.get("density", 0.25))
-                scenario_grid = _generate_connected_synthetic_map(width, height, density, seed=42 + run_id)
-                map_name = "synthetic"
+            if isinstance(scenario_config, dict):
+                width = int(scenario_config.get("width", 256))
+                height = int(scenario_config.get("height", width))
+                density = float(scenario_config.get("density", 0.25))
+                scenario_grid = _generate_connected_synthetic_map(width, height, density, seed=42 + int(scenario_config.get("scenario", 0)))
+                map_name = scenario_config.get("map_name", map_name)
                 density_label = _density_label(density)
             else:
-                scenario_grid, map_name, density_label = _resolve_grid(map_path, [scenario])
+                scenario_grid, map_name, density_label = _resolve_grid(map_path, [scenario_config])
         else:
-            if isinstance(scenario, dict):
-                density = float(scenario.get("density", 0.25))
+            if isinstance(scenario_config, dict):
+                density = float(scenario_config.get("density", 0.25))
                 density_label = _density_label(density)
-        start, goal = _coerce_scenario(scenario, scenario_grid)
-        map_key = (map_name, f"{scenario_grid.width}x{scenario_grid.height}", density_label, (scenario_grid.width, scenario_grid.height))
+
+        start, goal = _coerce_scenario(scenario_config, scenario_grid)
+        if isinstance(scenario_config, Scenario):
+            scenario_id = scenario_config.bucket
+            density_label = "real"
+        else:
+            scenario_id = int(scenario_config.get("scenario", 0)) if isinstance(scenario_config, dict) else 0
+        width = scenario_grid.width
+        height = scenario_grid.height
+        map_key = (map_name, f"{width}x{height}", density_label, (width, height))
+
         for algorithm_template in algorithms:
             algorithm_name = algorithm_template.name()
             if algorithm_name in {"HPAStar", "HPAJPS"}:
@@ -62,26 +92,100 @@ def run_experiment(
                     cached_algorithms[algorithm_name] = algorithm
             else:
                 algorithm = _clone_algorithm(algorithm_template, scenario_grid)
-            result = algorithm.search(start, goal)
-            results.append(
-                {
-                    "map_name": map_name,
-                    "size": f"{scenario_grid.width}x{scenario_grid.height}",
-                    "density": density_label,
-                    "algorithm": algorithm.name(),
-                    "run_id": run_id,
-                    "execution_time_ms": result.execution_time_ms,
-                    "nodes_expanded": result.nodes_expanded,
-                    "path_length": result.path_length,
-                    "path_cost": result.path_cost,
-                    "num_portals": result.num_portals,
-                    "num_jump_points": result.num_jump_points,
-                    "abstract_graph_size": result.abstract_graph_size,
-                    "preprocessing_time_ms": result.preprocessing_time_ms,
-                    "preprocessing_nodes_expanded": result.preprocessing_nodes_expanded,
-                    "success": result.success,
-                }
-            )
+
+            for repetition in range(repetitions):
+                # Log progress so long runs are visible to the user.
+                print(f"Running {algorithm.name()} on {map_name} scenario={scenario_id} rep={repetition}")
+
+                # Run each search in a separate process and enforce a timeout to
+                # avoid hangs/CPU runaway. Timeout seconds can be configured via
+                # the BENCH_TIMEOUT_SECS environment variable (default 30s).
+                timeout_s = float(os.environ.get("BENCH_TIMEOUT_SECS", 30))
+
+                q: multiprocessing.Queue = multiprocessing.Queue()
+                cls_name = algorithm.__class__.__name__
+                alg_kwargs = {"cluster_size": getattr(algorithm, "cluster_size", 10), "hybrid": getattr(algorithm, "hybrid", True)}
+                proc = multiprocessing.Process(target=_benchmark_worker, args=(q, cls_name, scenario_grid, alg_kwargs, start, goal))
+                proc.start()
+                proc.join(timeout_s)
+                timed_out = False
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join()
+                    timed_out = True
+
+                if timed_out:
+                    print(f"Search timed out: {algorithm.name()} map={map_name} scenario={scenario_id} rep={repetition} (>{timeout_s}s)")
+                    # Create a failure BenchmarkResult entry
+                    result = None
+                    success = False
+                    execution_time_ms = float(timeout_s * 1000)
+                    preprocessing_time_ms = 0.0
+                    nodes_expanded = 0
+                    path_length = 0.0
+                    path_cost = 0.0
+                    num_portals = 0
+                    num_jump_points = 0
+                    abstract_graph_size = 0
+                else:
+                    if q.empty():
+                        print(f"Search produced no result object for {algorithm.name()} map={map_name} scenario={scenario_id} rep={repetition}")
+                        result = None
+                        success = False
+                        execution_time_ms = 0.0
+                        preprocessing_time_ms = 0.0
+                        nodes_expanded = 0
+                        path_length = 0.0
+                        path_cost = 0.0
+                        num_portals = 0
+                        num_jump_points = 0
+                        abstract_graph_size = 0
+                    else:
+                        res_obj = q.get()
+                        if isinstance(res_obj, Exception):
+                            # Child raised an exception; surface it and mark failure.
+                            print(f"Search subprocess raised: {res_obj!r}")
+                            result = None
+                            success = False
+                            execution_time_ms = 0.0
+                            preprocessing_time_ms = 0.0
+                            nodes_expanded = 0
+                            path_length = 0.0
+                            path_cost = 0.0
+                            num_portals = 0
+                            num_jump_points = 0
+                            abstract_graph_size = 0
+                        else:
+                            result = res_obj
+                            success = result.success
+                            execution_time_ms = result.execution_time_ms
+                            preprocessing_time_ms = result.preprocessing_time_ms
+                            nodes_expanded = result.nodes_expanded
+                            path_length = result.path_length
+                            path_cost = result.path_cost
+                            num_portals = getattr(result, "num_portals", 0)
+                            num_jump_points = getattr(result, "num_jump_points", 0)
+                            abstract_graph_size = getattr(result, "abstract_graph_size", 0)
+
+                results.append(
+                    BenchmarkResult(
+                        algorithm=algorithm.name(),
+                        map_name=map_name,
+                        width=width,
+                        height=height,
+                        density=density_label,
+                        scenario=scenario_id * repetitions + repetition,
+                        execution_time_ms=execution_time_ms,
+                        preprocessing_time_ms=preprocessing_time_ms,
+                        nodes_expanded=nodes_expanded,
+                        path_length=path_length,
+                        path_cost=path_cost,
+                        portals=num_portals,
+                        jump_points=num_jump_points,
+                        abstract_graph_size=abstract_graph_size,
+                        success=success,
+                    )
+                )
 
     return results
 

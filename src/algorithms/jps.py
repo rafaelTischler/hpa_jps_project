@@ -153,6 +153,12 @@ class JPS(AStar):
         nx, ny = x + dx, y + dy
         if not self.grid.is_walkable(nx, ny):
             return None
+        # Safety guard: avoid runaway recursion by bounding depth to a
+        # reasonable upper limit based on grid size. This prevents hangs if
+        # the jump logic enters a pathological loop.
+        max_depth = self.grid.width * self.grid.height
+        if depth > max_depth:
+            return None
 
         current = (nx, ny)
         if current == goal:
