@@ -1,0 +1,5 @@
+map_name,size,density,algorithm,run_id,execution_time_ms,nodes_expanded,path_length,path_cost,num_portals,num_jump_points,abstract_graph_size,preprocessing_time_ms,preprocessing_nodes_expanded,success
+random512-10-0,512x512,low,AStar,0,127.00780000159284,14272,532.0,734.964645562821,0,0,0,0.0,0,True
+random512-10-0,512x512,low,JPS,0,131.82859999506036,11150,538.0,738.4793641885824,0,0,0,0.0,0,True
+random512-10-0,512x512,low,HPAStar,0,908.9538999978686,26734,539.0,739.0651506262093,26612,0,26614,101420.15350000293,18289450,True
+random512-10-0,512x512,low,HPAJPS,0,6443.947799998568,53889,533.0,735.5504320004479,53767,49637,53769,203722.46799999994,36709549,True
